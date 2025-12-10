@@ -882,6 +882,24 @@ Send payment and transfer reminders to customers by consuming reminder job event
 - `RETRY_MAX_ATTEMPTS`: 3
 - `CIRCUIT_BREAKER_THRESHOLD`: 5
 
+**Performance Characteristics**:
+- **Processing Time per Reminder**:
+  - Average (p50): 200ms
+  - Worst case (p99): 500ms
+- **Processing Breakdown**:
+  - Idempotency check (Redis): 2ms
+  - CRM Service call (gRPC/mTLS): 80-250ms
+    - Network latency: 2-5ms
+    - CRM processing: 60-200ms
+    - Response serialization: 3-10ms
+  - Notification Service call (gRPC/mTLS): 100-230ms
+    - Network latency: 2-5ms
+    - Notification delivery: 90-200ms (email/SMS/push)
+    - Response serialization: 3-10ms
+  - Lifecycle event publishing: 5-10ms
+  - Kafka offset commit: 2-5ms
+- **Batch Processing**: 50 reminders per batch enables parallel processing
+
 **Scaling**:
 - **Horizontal**: 2-10 pods (HPA based on consumer lag and CPU)
 - **Vertical**: 2 vCPU, 4GB RAM per pod
@@ -897,7 +915,9 @@ Send payment and transfer reminders to customers by consuming reminder job event
 - **Key Metrics**:
   - Consumer lag
   - Reminder delivery success rate
-  - Reminder delivery duration
+  - Reminder processing time (p50, p95, p99)
+  - CRM Service call latency
+  - Notification Service call latency
   - Circuit breaker state
   - Batch processing throughput (reminders/second)
 - **Alerts**:
@@ -944,13 +964,34 @@ Execute recurring payments (loan installments, subscriptions) and schedule next 
 
 **Configuration**:
 - `KAFKA_CONSUMER_GROUP`: recurring-payment-worker-group
-- `KAFKA_CONSUMER_CONCURRENCY`: 8
+- `KAFKA_CONSUMER_CONCURRENCY`: 6
 - `KAFKA_MAX_POLL_RECORDS`: 50
 - `JOB_EXECUTION_TIMEOUT`: 30000ms
 - `RETRY_MAX_ATTEMPTS`: 3
 - `RETRY_BACKOFF_MS`: 2000, 4000, 8000
 - `CIRCUIT_BREAKER_THRESHOLD`: 5
 - `SCHEDULER_API_URL`: http://task-scheduler.svc.cluster.local:8080
+
+**Performance Characteristics**:
+- **Processing Time per Recurring Payment**:
+  - Average (p50): 600ms
+  - Worst case (p99): 1500ms (1.5 seconds)
+- **Processing Breakdown**:
+  - Idempotency check (Redis): 2ms
+  - Payment Execution Service call (gRPC/mTLS): 500-1400ms
+    - Network latency: 2-5ms
+    - Payment processing (BIAN SD-003): 450-1300ms
+      - Payment validation: 50-150ms
+      - Payment execution: 350-1000ms
+      - Payment confirmation: 50-150ms
+    - Response serialization: 3-10ms
+  - Next occurrence scheduling (Scheduler API): 80-100ms
+    - Network latency: 2-5ms
+    - API processing: 70-90ms
+    - Response handling: 3-5ms
+  - Lifecycle event publishing: 5-10ms
+  - Kafka offset commit: 2-5ms
+- **Note**: Longer processing time due to payment execution complexity and next occurrence scheduling
 
 **Scaling**:
 - **Horizontal**: 2-8 pods (HPA based on consumer lag and CPU)
@@ -968,7 +1009,9 @@ Execute recurring payments (loan installments, subscriptions) and schedule next 
 - **Key Metrics**:
   - Consumer lag
   - Payment execution success rate
-  - Payment execution duration
+  - Payment processing time (p50, p95, p99)
+  - Payment Execution Service call latency
+  - Next occurrence scheduling latency
   - Next occurrence scheduling success rate
   - Circuit breaker state
 - **Alerts**:
@@ -1461,8 +1504,12 @@ Total End-to-End Latency: p50 = 59ms, p95 = 200ms, p99 = 400ms
 - **Scheduler Throughput**: 3,000 TPS (event publishing capacity, non-blocking)
 - **Worker Throughput**: 8,000+ TPS aggregate (scales independently per worker type)
   - TransferWorker: 3,000 TPS (3-15 pods × 10 concurrency)
-  - ReminderWorker: 3,000 TPS (2-10 pods × 8 concurrency, supports batching)
-  - RecurringPaymentWorker: 2,000 TPS (2-8 pods × 6 concurrency)
+  - ReminderWorker: 320-800 TPS (2-10 pods × 8 concurrency, 200-500ms per reminder)
+    - Base scale (2 pods): 80 reminders/sec (40,000 reminders in ~8-10 minutes)
+    - Peak scale (10 pods): 400 reminders/sec (40,000 reminders in ~1.7-2 minutes)
+  - RecurringPaymentWorker: 32-320 TPS (2-8 pods × 6 concurrency, 600-1500ms per payment)
+    - Base scale (2 pods): 20 payments/sec (10,000 payments in ~8-9 minutes)
+    - Peak scale (8 pods): 80 payments/sec (10,000 payments in ~2-3 minutes)
 - **History Service Throughput**: 10,000 TPS (event materialization + query API)
   - Event processing: 8,000 TPS (lightweight state derivation + database updates)
   - Query API: 2,000 TPS (with 80%+ cache hit rate)
@@ -2359,12 +2406,70 @@ Total End-to-End Latency: p50 = 59ms, p95 = 200ms, p99 = 400ms
 (Scheduler dispatch + Worker execution + State materialization)
 ```
 
+#### ReminderWorker-Specific Latency
+
+**Note**: ReminderWorker has different latency characteristics due to external service dependencies (CRM + Notification Services).
+
+```
+ReminderWorker Execution: p50 = 200ms, p95 = 400ms, p99 = 500ms
+├─ Kafka consumption lag: <1ms (steady state)
+├─ Idempotency check (Redis): 2ms
+├─ CRM Service call (gRPC): 80ms (avg) to 250ms (p99)
+│  ├─ Network latency: 2-5ms
+│  ├─ CRM processing: 60-200ms
+│  └─ Response serialization: 3-10ms
+├─ Notification Service call (gRPC): 100ms (avg) to 230ms (p99)
+│  ├─ Network latency: 2-5ms
+│  ├─ Notification delivery: 90-200ms (email/SMS/push)
+│  └─ Response serialization: 3-10ms
+├─ Lifecycle event publishing: 5-10ms
+└─ Kafka offset commit: 2-5ms
+
+Total End-to-End Latency (Reminder Jobs): p50 = 210ms, p95 = 450ms, p99 = 600ms
+(Scheduler dispatch ~10ms + ReminderWorker execution 200-500ms + State materialization ~50-100ms)
+```
+
+**Comparison to Generic Worker**:
+- Generic Worker (TransferWorker): p50=34ms, p95=100ms, p99=200ms
+- ReminderWorker: p50=200ms, p95=400ms, p99=500ms (5-6x slower due to dual service calls)
+
+#### RecurringPaymentWorker-Specific Latency
+
+**Note**: RecurringPaymentWorker has different latency characteristics due to payment execution complexity and next occurrence scheduling.
+
+```
+RecurringPaymentWorker Execution: p50 = 600ms, p95 = 1200ms, p99 = 1500ms
+├─ Kafka consumption lag: <1ms (steady state)
+├─ Idempotency check (Redis): 2ms
+├─ Payment Execution Service call (gRPC): 500ms (avg) to 1400ms (p99)
+│  ├─ Network latency: 2-5ms
+│  ├─ Payment processing (BIAN SD-003): 450-1300ms
+│  │  ├─ Payment validation: 50-150ms
+│  │  ├─ Payment execution: 350-1000ms
+│  │  └─ Payment confirmation: 50-150ms
+│  └─ Response serialization: 3-10ms
+├─ Next occurrence scheduling (Scheduler API): 80-100ms
+│  ├─ Network latency: 2-5ms
+│  ├─ API processing: 70-90ms
+│  └─ Response handling: 3-5ms
+├─ Lifecycle event publishing: 5-10ms
+└─ Kafka offset commit: 2-5ms
+
+Total End-to-End Latency (Recurring Payment Jobs): p50 = 610ms, p95 = 1250ms, p99 = 1600ms
+(Scheduler dispatch ~10ms + RecurringPaymentWorker execution 600-1500ms + State materialization ~50-100ms)
+```
+
+**Comparison Across All Workers**:
+- TransferWorker: p50=34ms, p95=100ms, p99=200ms
+- ReminderWorker: p50=200ms, p95=400ms, p99=500ms (5-6x slower than TransferWorker)
+- RecurringPaymentWorker: p50=600ms, p95=1200ms, p99=1500ms (17-18x slower than TransferWorker, 3x slower than ReminderWorker)
+
 #### Throughput
 
 | Category | Average TPS | Peak TPS | System Limit | Measurement Period |
 |----------|-------------|----------|--------------|-------------------|
 | **Write TPS** (Job Creation) | 180 transactions/second | 300 transactions/second | 1,000 TPS | Average over sustained operations; Peak during high-load periods |
-| **Processing TPS** (Job Execution) | 300 transactions/second | 500 transactions/second | 2,000 TPS | Average over sustained operations; Peak during high-load periods |
+| **Processing TPS** (Job Execution) | 300 transactions/second (avg across all workers) | 500 transactions/second (peak) | 2,000 TPS (system limit) | Average over sustained operations; Worker-specific: TransferWorker (highest), ReminderWorker: 80-400 TPS (2-10 pods), RecurringPaymentWorker: 20-80 TPS (2-8 pods) |
 | **Read TPS** (Job History Queries) | 500 transactions/second | 2,000 transactions/second | 5,000 TPS | Average during normal operations; Peak during dashboard/reporting usage with 80%+ cache hit rate |
 
 **Bottlenecks**:
